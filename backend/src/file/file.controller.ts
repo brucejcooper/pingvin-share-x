@@ -3,6 +3,7 @@ import {
   Controller,
   Delete,
   Get,
+  Headers,
   Param,
   Post,
   Query,
@@ -87,22 +88,54 @@ export class FileController {
     @Param("fileId") fileId: string,
     @Query("download") download = "true",
     @Query("recipient") recipientId?: string,
+    @Headers("range") rangeHeader?: string,
   ) {
-    const file = await this.fileService.get(shareId, fileId);
+    const file = await this.fileService.get(shareId, fileId, rangeHeader);
     const isDownload = download === "true";
 
-    const headers = {
-      "Content-Type":
-        mime?.lookup?.(file.metaData.name) || "application/octet-stream",
-      "Content-Length": file.metaData.size,
-      "Content-Security-Policy": "sandbox",
-      "Content-Disposition": contentDisposition(
-        file.metaData.name,
-        isDownload ? undefined : { type: "inline" },
-      ),
-    };
+    const contentType =
+      mime?.lookup?.(file.metaData.name) || "application/octet-stream";
+    const contentDispositionValue = contentDisposition(
+      file.metaData.name,
+      isDownload ? undefined : { type: "inline" },
+    );
 
-    res.set(headers);
+    // Range requested but unsatisfiable -> 416 with the total size.
+    if (file.rangeNotSatisfiable) {
+      res.status(416);
+      res.set({
+        "Accept-Ranges": "bytes",
+        "Content-Range": `bytes */${file.range.size}`,
+      });
+      return new StreamableFile(file.file);
+    }
+
+    // Partial content -> 206 with the served slice's headers. `Accept-Ranges`
+    // advertises seek support; `Content-Range`/`Content-Length` describe the
+    // slice so the browser can stream and seek instead of buffering the whole
+    // file first.
+    if (file.range) {
+      const { start, end, size } = file.range;
+      res.status(206);
+      res.set({
+        "Content-Type": contentType,
+        "Content-Length": (end - start + 1).toString(),
+        "Content-Range": `bytes ${start}-${end}/${size}`,
+        "Accept-Ranges": "bytes",
+        "Content-Security-Policy": "sandbox",
+        "Content-Disposition": contentDispositionValue,
+      });
+    } else {
+      res.set({
+        "Content-Type": contentType,
+        "Content-Length": file.metaData.size,
+        // Advertise range support so players know they can seek even before
+        // they issue a range request.
+        "Accept-Ranges": "bytes",
+        "Content-Security-Policy": "sandbox",
+        "Content-Disposition": contentDispositionValue,
+      });
+    }
 
     if (isDownload) {
       void this.fileService.notifyRecipientDownload(

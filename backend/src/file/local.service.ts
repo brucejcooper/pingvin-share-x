@@ -122,7 +122,7 @@ export class LocalFileService {
     return file;
   }
 
-  async get(shareId: string, fileId: string) {
+  async get(shareId: string, fileId: string, rangeHeader?: string) {
     const fileMetaData = await this.prisma.file.findUnique({
       where: { id: fileId },
     });
@@ -130,16 +130,47 @@ export class LocalFileService {
     if (!fileMetaData)
       throw new NotFoundException(this.i18n.t("file.notFound"));
 
-    const file = createReadStream(`${SHARE_DIRECTORY}/${shareId}/${fileId}`);
+    const path = `${SHARE_DIRECTORY}/${shareId}/${fileId}`;
+    // Use the on-disk size as the authoritative total so range maths stays
+    // correct even if the DB row ever drifts from the actual file.
+    const totalSize = (await fs.stat(path)).size;
 
-    return {
-      metaData: {
-        mimeType: mime.contentType(fileMetaData.name.split(".").pop()),
-        ...fileMetaData,
-        size: fileMetaData.size,
-      },
-      file,
+    const metaData = {
+      mimeType: mime.contentType(fileMetaData.name.split(".").pop()),
+      ...fileMetaData,
+      size: totalSize.toString(),
     };
+
+    const parsedRange = rangeHeader
+      ? parseRangeHeader(rangeHeader, totalSize)
+      : null;
+
+    // Range present but unsatisfiable -> controller answers 416.
+    if (parsedRange === "unsatisfiable") {
+      return {
+        metaData,
+        file: Readable.from([]),
+        rangeNotSatisfiable: true,
+        range: { start: 0, end: 0, size: totalSize },
+      };
+    }
+
+    // Satisfiable range -> stream just the requested slice (enables seeking
+    // and play-before-fully-downloaded in browser <video>/<audio> players).
+    if (parsedRange) {
+      const file = createReadStream(path, {
+        start: parsedRange.start,
+        end: parsedRange.end,
+      });
+      return {
+        metaData,
+        file,
+        range: { ...parsedRange, size: totalSize },
+      };
+    }
+
+    const file = createReadStream(path);
+    return { metaData, file };
   }
 
   async remove(shareId: string, fileId: string) {
@@ -177,4 +208,43 @@ export class LocalFileService {
       });
     });
   }
+}
+
+/**
+ * Parse a single-range HTTP `Range` header (RFC 7233) against a known total
+ * size. Returns an inclusive `{ start, end }` byte range, the string
+ * `"unsatisfiable"` when the range is valid syntax but cannot be served (416),
+ * or `null` when the header is absent/malformed/multi-range, in which case the
+ * caller should fall back to serving the whole file. Browsers only ever send a
+ * single range for media playback, so multi-range support is intentionally
+ * omitted.
+ */
+function parseRangeHeader(
+  header: string,
+  size: number,
+): { start: number; end: number } | "unsatisfiable" | null {
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!match) return null;
+
+  const [, startStr, endStr] = match;
+  if (startStr === "" && endStr === "") return null;
+
+  let start: number;
+  let end: number;
+
+  if (startStr === "") {
+    // Suffix range: the final `endStr` bytes of the file.
+    const suffixLength = parseInt(endStr, 10);
+    if (suffixLength === 0) return "unsatisfiable";
+    start = Math.max(size - suffixLength, 0);
+    end = size - 1;
+  } else {
+    start = parseInt(startStr, 10);
+    end = endStr === "" ? size - 1 : parseInt(endStr, 10);
+    // Clamp an over-long end to the last byte, as permitted by the spec.
+    if (end > size - 1) end = size - 1;
+  }
+
+  if (start > end || start >= size) return "unsatisfiable";
+  return { start, end };
 }
